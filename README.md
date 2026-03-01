@@ -1,54 +1,54 @@
 
-fetch_and_scan.py
+# fetch_and_scan.py
 
 Targeted JavaScript Fetcher & Recon Scanner
 Scope-aware | Noise-controlled | Built for Manual Hunters
 fetch_and_scan.py is a precision-focused JavaScript fetcher and pattern scanner designed for bug bounty reconnaissance and manual API discovery.
 It integrates cleanly into modern recon workflows and avoids the noise explosion caused by blind mass-downloading tools.
-The tool:
-• Fetches JavaScript from scoped URL lists
 
-• Verifies real JS content before saving
+### The tool:
 
-• Deduplicates via content hashing
+ • Fetches JavaScript from scoped URL lists 
 
-• Scans for high-value patterns (tokens, endpoints, GraphQL, secrets)
+ • Verifies real JS content before saving 
 
-• Supports advanced filtering and custom headers
+ • Deduplicates via content hashing 
 
-• Integrates seamlessly with Burp, ZAP, or custom pipelines
+ • Scans for high-value patterns (tokens, endpoints, GraphQL, secrets) 
 
+ • Supports advanced filtering and custom headers 
 
+ • Integrates seamlessly with Burp, ZAP, or custom pipelines 
 
-✨ Features
+##
 
-JavaScript Collection
-• Fetch JS from CSV or plain-text lists
+## ✨ Features
+
+### JavaScript Collection
+
+ • Fetch JS from CSV or plain-text lists
  • Validate content-type before saving
  • Skip HTML/CSS/JSON responses
  • Hash-based deduplication
  • Retry with exponential backoff
  • Threaded downloader
 
-Advanced Scope Control
-• Regex-based include filtering
+### Advanced Scope Control:
+
+ • Regex-based include filtering
  • Regex-based exclude filtering
  • Glob-style post-filtering via --grep
  • Custom header injection
  • Proxy support
  • Optional TLS disable
-Filtering order:
+ 
+ ##
+
+### Filtering order:
 
 
 
-include → exclude → grep → fetch → scan
-
-
-
-
-
-
-
+ include → exclude → grep → fetch → scan 
 
 
 
@@ -56,9 +56,17 @@ include → exclude → grep → fetch → scan
 
 
 
-Secret & Endpoint Detection
-Scans JavaScript for:
-• API keys
+
+
+
+
+
+
+
+### Secret & Endpoint Detection
+ Scans JavaScript for: 
+
+ • API keys
  • Bearer tokens / JWTs
  • GraphQL queries & mutations
  • REST endpoints
@@ -68,22 +76,28 @@ Scans JavaScript for:
  • WebSocket endpoints
  • Internal IPs
  • Debug flags
-Pattern engine is easily extendable inside the script.
+ 
+ Pattern engine is easily extendable inside the script. 
 
-📦 Output Structure
+##
+
+## 📦 Output Structure
+
+
 After execution:
 
 
 
-js_src/
+ js_src/ 
     saved JavaScript files
 
-fetch_map.txt
+ fetch_map.txt 
     URL → saved path → status
 
-findings.txt
+ findings.txt 
     Pattern matches
 
+    
 
 
 
@@ -97,12 +111,15 @@ findings.txt
 
 
 
-Example fetch_map.txt
+##
+
+ Example fetch_map.txt 
 
 
-
+~~~ bash
 https://<TARGET>/static/app.js    js_src/4a7b2c.js    200
 https://<TARGET>/index            (empty)             SKIP_NOT_JS:200;ctype=text/html
+~~~
 
 
 
@@ -116,13 +133,13 @@ https://<TARGET>/index            (empty)             SKIP_NOT_JS:200;ctype=text
 
 
 
-
-Example findings.txt
-
+ Example findings.txt 
 
 
+~~~ bash
 js_src/4a7b2c.js    122    jwt_token    eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 js_src/4a7b2c.js    310    graphql_mutation    mutation updateUser(...)
+~~~
 
 
 
@@ -134,19 +151,22 @@ js_src/4a7b2c.js    310    graphql_mutation    mutation updateUser(...)
 
 
 
+##
 
+## 🚀 Installation
 
+ Requirements: 
 
-🚀 Installation
-Requirements:
 • Python 3.8+
  • requests
  • tqdm
-Install dependencies:
+ 
+Install dependencies: 
 
 
-
+~~~ bash
 pip3 install requests tqdm
+~~~
 
 
 
@@ -159,12 +179,12 @@ pip3 install requests tqdm
 
 
 
-
-Optional:
-
+ Optional: 
 
 
+~~~
 chmod +x fetch_and_scan.py
+~~~
 
 
 
@@ -176,19 +196,20 @@ chmod +x fetch_and_scan.py
 
 
 
+##
 
+## 📁 Input Formats
 
-
-📁 Input Formats
-Supports:
+ Supports: 
 
 CSV
 
 
-
+~~~ CSV
 url,status
 https://<TARGET>/app.js,200
 https://<TARGET>/lib/main.js,200
+~~~
 
 
 
@@ -202,13 +223,13 @@ https://<TARGET>/lib/main.js,200
 
 
 
-
-Plain Text
-
+ Plain Text 
 
 
+~~~ bash
 https://<TARGET>/app.js
 https://<TARGET>/scripts/vendor.js
+~~~
 
 
 
@@ -220,15 +241,16 @@ https://<TARGET>/scripts/vendor.js
 
 
 
+##
+
+## ⚙️ Basic Usage
+
+ Fetch and scan all JS from input list: 
 
 
-
-⚙️ Basic Usage
-Fetch and scan all JS from input list:
-
-
-
+~~~ bash
 python3 fetch_and_scan.py -i js_urls.txt
+~~~
 
 
 
@@ -240,15 +262,16 @@ python3 fetch_and_scan.py -i js_urls.txt
 
 
 
+##
+
+## 🎯 Scope Filtering
+
+ Only process URLs matching a regex: 
 
 
-
-🎯 Scope Filtering
-Only process URLs matching a regex:
-
-
-
+~~~ bash
 --include 'https://<TARGET_REGEX>/'
+~~~
 
 
 
@@ -261,12 +284,12 @@ Only process URLs matching a regex:
 
 
 
-
-Exclude known noisy hosts:
-
+ **Exclude known noisy hosts:**
 
 
+~~~ bash
 --exclude 'cdn|static|analytics'
+~~~
 
 
 
@@ -278,17 +301,19 @@ Exclude known noisy hosts:
 
 
 
+##
+
+## 🔍 Using --grep (Glob Filtering)
+
+**Applied after include/exclude filtering.**
+
+ Examples: 
+*Only URLs under /api/:*
 
 
-
-🔍 Using --grep (Glob Filtering)
-Applied after include/exclude filtering.
-Examples:
-Only URLs under /api/:
-
-
-
+~~~ bash
 --grep '*/api/*'
+~~~
 
 
 
@@ -301,12 +326,12 @@ Only URLs under /api/:
 
 
 
-
-Only GraphQL-related paths:
-
+**Only GraphQL-related paths:**
 
 
+~~~ bash
 --grep '*graphql*'
+~~~
 
 
 
@@ -319,12 +344,12 @@ Only GraphQL-related paths:
 
 
 
-
-Multiple filters allowed:
-
+**Multiple filters allowed:**
 
 
+~~~ bash
 --grep '*/api/*' --grep '*/admin/*'
+~~~
 
 
 
@@ -336,16 +361,17 @@ Multiple filters allowed:
 
 
 
+##
+
+## 🔐 Custom Headers
+
+**Inject custom headers for authenticated JS fetching:**
 
 
-
-🔐 Custom Headers
-Inject custom headers for authenticated JS fetching:
-
-
-
+~~~ bash
 --header 'Authorization: Bearer <TOKEN>'
 --header 'X-Custom-Header: <VALUE>'
+~~~
 
 
 
@@ -358,15 +384,18 @@ Inject custom headers for authenticated JS fetching:
 
 
 
+**Multiple headers supported.**
 
-Multiple headers supported.
+##
 
-🌐 Proxy Support
-Route traffic through Burp or ZAP:
+## 🌐 Proxy Support
+
+**Route traffic through Burp or ZAP:**
 
 
-
+~~~ bash
 --proxy http://127.0.0.1:8080
+~~~
 
 
 
@@ -379,12 +408,12 @@ Route traffic through Burp or ZAP:
 
 
 
-
-Disable TLS verification if required:
-
+**Disable TLS verification if required:**
 
 
+~~~ bash
 --insecure
+~~~
 
 
 
@@ -396,15 +425,16 @@ Disable TLS verification if required:
 
 
 
+##
 
+## ⚡ Performance Tuning
 
-
-⚡ Performance Tuning
 Threads:
 
 
-
+~~~ bash
 -w 6
+~~~
 
 
 
@@ -417,12 +447,12 @@ Threads:
 
 
 
-
-Delay between requests:
-
+**Delay between requests:**
 
 
+~~~ bash
 --delay 0.2
+~~~
 
 
 
@@ -435,12 +465,12 @@ Delay between requests:
 
 
 
-
-Example balanced configuration:
-
+**Example balanced configuration:**
 
 
+~~~ bash
 -w 5 --delay 0.15
+~~~
 
 
 
@@ -452,15 +482,14 @@ Example balanced configuration:
 
 
 
+##
+
+## 🧪 Advanced Usage Examples
+
+### 1️⃣ Classic Bug Bounty JS Recon (Proxy Enabled)
 
 
-
-🧪 Advanced Usage Examples
-
-1️⃣ Classic Bug Bounty JS Recon (Proxy Enabled)
-
-
-
+~~~ shell
 python3 fetch_and_scan.py \
   -i scoped_js_list.txt \
   --include 'https://<TARGET_REGEX>/' \
@@ -469,6 +498,7 @@ python3 fetch_and_scan.py \
   --insecure \
   -w 6 \
   --delay 0.2
+~~~
 
 
 
@@ -480,17 +510,17 @@ python3 fetch_and_scan.py \
 
 
 
+##
+
+## 2️⃣ GraphQL-Focused Discovery
 
 
-
-2️⃣ GraphQL-Focused Discovery
-
-
-
+~~~ shell
 python3 fetch_and_scan.py \
   -i js_urls.txt \
   --include 'https://<TARGET_REGEX>/' \
   --grep '*graphql*'
+~~~
 
 
 
@@ -502,17 +532,17 @@ python3 fetch_and_scan.py \
 
 
 
+##
+
+## 3️⃣ Token Hunting Across Large JS Set
 
 
-
-3️⃣ Token Hunting Across Large JS Set
-
-
-
+~~~ bash
 python3 fetch_and_scan.py \
   -i full_domain_js.txt \
   --grep '*auth*' \
   --grep '*token*'
+~~~
 
 
 
@@ -524,18 +554,18 @@ python3 fetch_and_scan.py \
 
 
 
+##
+
+## 4️⃣ Authenticated JS Fetch (Protected Apps)
 
 
-
-4️⃣ Authenticated JS Fetch (Protected Apps)
-
-
-
+~~~
 python3 fetch_and_scan.py \
   -i private_js_list.txt \
   --include 'https://<TARGET_REGEX>/' \
   --header 'Authorization: Bearer <ACCESS_TOKEN>' \
   --header 'X-Requested-With: XMLHttpRequest'
+~~~
 
 
 
@@ -547,45 +577,57 @@ python3 fetch_and_scan.py \
 
 
 
+##
 
+## 🧠 Recon Methodology Integration
 
+### Modern workflow:
 
-🧠 Recon Methodology Integration
-Modern workflow:
+1.  Crawl
 
-Step 1 – Crawl
+~~~~1
 Use:
 • katana
  • gospider
  • Burp site map export
  • browser DevTools
-
-Step 2 – Extract JS URLs
+~~~~
+2. Extract JS URLs
+~~~~2
 From crawler output → feed into fetch_and_scan.
-
-Step 3 – Run Scoped Scan
+~~~~
+3.  Run Scoped Scan
+~~~~3
 Apply:
 • include boundaries
  • exclude noise
  • grep targeting
+~~~~
 
-Step 4 – Review findings.txt
+4.  Review findings.txt
+~~~~4
 Look for:
 • JWT tokens
  • GraphQL schemas
  • Internal REST endpoints
  • Debug features
  • Hardcoded credentials
-
-Step 5 – Manual Deep Dive
+~~~~
+5.  Manual Deep Dive
+~~~~5
 Feed interesting endpoints into:
 • Burp Repeater
  • Custom GraphQL probes
  • API fuzzers
  • Banner scanning pipeline
+~~~~
 
-🔬 Why This Tool Exists
-Most JS scanners:
+###
+###
+
+## 🔬 Why This Tool Exists
+
+**Most JS scanners:**
 ◇ Download everything
 
 ◇ Generate massive noise
@@ -595,17 +637,23 @@ Most JS scanners:
 ◇ Don't integrate cleanly with manual workflows
 
 
-fetch_and_scan.py is built for:
-✔ Precision
+### fetch_and_scan.py is built for:
+
+ ✔ Precision
  ✔ Control
  ✔ Recon discipline
  ✔ Human-driven investigation
 
-⚠️ Operational Safety
-Always:
-• Respect program scope
+###
+###
+
+## ⚠️ Operational Safety
+
+*Always:*
+ • Respect program scope
  • Respect rate limits
  • Avoid over-threading
  • Use delay for fragile targets
  • Do not mass-scan third-party CDNs
-This tool is designed for authorized testing only.
+ 
+*This tool is designed for authorized testing only.*

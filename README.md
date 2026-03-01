@@ -628,6 +628,7 @@ Feed interesting endpoints into:
 ## 🔬 Why This Tool Exists
 
 **Most JS scanners:**
+
 ◇ Download everything
 
 ◇ Generate massive noise

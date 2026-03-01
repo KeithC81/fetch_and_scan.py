@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""
+fetch_and_scan.py (patched)
+
+Download JavaScript files (and optionally other content) from a URL list and scan them for:
+  - Secrets / keys / tokens
+  - Embedded URLs and endpoints (absolute + common relative forms)
+  - API/GraphQL/SPARQL/Triply/OIDC hints
+
+Input:
+  * CSV with a "url" column
+  * Plain text: one URL per line
+
+Outputs (by default):
+  js_src/                 downloaded files
+  fetch_map.txt           "<url>\t<path>\t<status|error>"
+  findings.txt            "<file>\t<line>\t<rule>\t<match>\t<snippet>"
+  results.json            {
+                            "fetch": [ {url, final_url, path, status, ctype, headers?}, ... ],
+                            "findings": [ {url, file, line, rule, match, snippet}, ... ]
+                          }
+
+New in this patched version:
+  - Smarter JS detection (content-type OR extension OR content sniff)
+  - Extra patterns: Triply/queries/datasets/sparql, GraphQL ops, OIDC/OAuth clues, common API key headers
+  - Optional header capture:
+      --save-headers
+      --headers-jsonl headers.jsonl
+  - Safer threading: create a requests.Session per worker request (instead of sharing one Session across threads)
+
+Designed for recon pipelines: results.json is stable and easy to ingest.
+"""
+
+import argparse
+import csv
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Tuple
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# tqdm is nice but optional
+try:
+    from tqdm import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+# Optional JS beautifier
+try:
+    import jsbeautifier  # type: ignore
+except Exception:  # pragma: no cover
+    jsbeautifier = None
+
+
+DEFAULT_OUTDIR = "js_src"
+DEFAULT_MAP_FILE = "fetch_map.txt"
+DEFAULT_FINDINGS_FILE = "findings.txt"
+DEFAULT_RESULTS_JSON = "results.json"
+DEFAULT_HEADERS_JSONL = "headers.jsonl"
+
+
+def build_patterns():
+    """
+    Compile regex rules for interesting findings.
+    Extend/tweak as your methodology evolves.
+    """
+    rules = {
+        # JWT-like blobs
+        "JWT": r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
+
+        # AWS access key id
+        "AWS_ACCESS_KEY": r"AKIA[0-9A-Z]{16}",
+
+        # Common API key header names / config keys
+        "API_KEY_HEADER_HINT": r"(?i)\b(x-api-key|api[_-]?key|subscriptionkey|ocp-apim-subscription-key)\b",
+
+        # Generic 'something that looks like a secret' (heuristic)
+        "GENERIC_SECRET": r"(?i)(secret|token|api[_-]?key|authorization)[^\n]{0,80}['\"][A-Za-z0-9_\-]{8,}['\"]",
+
+        # Basic auth headers
+        "BASIC_AUTH": r"Basic [A-Za-z0-9+/=]{8,}",
+
+        # Private key blocks
+        "PRIVATE_KEY": r"-----BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY-----",
+
+        # Absolute URLs
+        "URL_ABS": r"https?://[A-Za-z0-9\.\-_:]+(?:/[^\s\"'<>]*)?",
+
+        # Common relative endpoints in JS strings
+        "URL_REL": r"(?:(?:['\"])\/(?:api|rest|graphql|v1|v2|v3|auth|oauth|login|token|session|query|queries|datasets|sparql)[^\s\"'<>]*)(?:['\"])",
+
+        # API-ish hint (broad)
+        "API_HINT": r"(?i)\/(?:api|rest|graphql|v1|v2|v3|oauth|auth|token|login|session)\b[^\s\"'<>]*",
+
+        # GraphQL op definitions (useful even if introspection disabled)
+        "GRAPHQL_OP_DEF": r"(?i)\b(query|mutation|subscription)\s+[A-Za-z_][A-Za-z0-9_]*\s*\{",
+
+        # GraphQL client opName payloads
+        "GRAPHQL_OPERATION_NAME": r"(?i)\"operationName\"\s*:\s*\"[A-Za-z_][A-Za-z0-9_]*\"",
+
+        # OIDC/OAuth well-known + endpoints
+        "OIDC_WELL_KNOWN": r"(?i)\.well-known\/openid-configuration",
+        "OAUTH_CLIENT_HINTS": r"(?i)\b(client_id|redirect_uri|authorization_endpoint|token_endpoint)\b",
+
+        # Triply / linked-data platform hints (common in Triply stacks)
+        "TRIPLY_HINTS": r"(?i)\b(x-triply-api|triply)\b",
+        "TRIPLY_PATHS": r"(?i)\/(?:queries|datasets|sparql)\/[^\s\"'<>]+",
+
+        # Source maps (often lead to more endpoints)
+        "SOURCEMAP": r"(?i)sourceMappingURL\s*=\s*([^\s]+)",
+
+        # Common service panels
+        "OBSERVABILITY_HINTS": r"(?i)\/(?:grafana|kibana|prometheus|metrics|actuator)\b[^\s\"'<>]*",
+    }
+    return {name: re.compile(rx) for name, rx in rules.items()}
+
+
+def filename_for_url(url: str, outdir: str, force_ext: Optional[str] = None) -> str:
+    h = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    ext = force_ext if force_ext else ".js"
+    return os.path.join(outdir, f"{h}{ext}")
+
+
+def dedupe_keep_order(urls: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for u in urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def load_urls(path: str) -> List[str]:
+    """
+    Read input file:
+      - CSV with 'url' column
+      - or plain text (one URL per line)
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+    urls: List[str] = []
+
+    # Try CSV first
+    try:
+        with open(path, newline="", encoding="utf-8", errors="ignore") as fh:
+            reader = csv.DictReader(fh)
+            if reader.fieldnames and any(f.lower() == "url" for f in reader.fieldnames):
+                for row in reader:
+                    u = (row.get("url") or "").strip()
+                    if u:
+                        urls.append(u)
+                return dedupe_keep_order(urls)
+    except Exception:
+        pass
+
+    # Fallback: plain text
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            urls.append(line)
+
+    return dedupe_keep_order(urls)
+
+
+def grep_match(url: str, pattern: str, mode: str) -> bool:
+    """
+    mode:
+      - glob: fnmatch
+      - substr: substring
+      - regex: re.search
+      - auto: heuristics (if looks like regex -> regex; if has *?[] -> glob; else substr)
+    """
+    if mode == "auto":
+        if any(ch in pattern for ch in ["*", "?", "[", "]"]):
+            mode = "glob"
+        elif any(ch in pattern for ch in ["\\", "(", ")", "|", "^", "$", "+", "{", "}"]):
+            mode = "regex"
+        else:
+            mode = "substr"
+
+    if mode == "glob":
+        return fnmatch.fnmatch(url, pattern)
+    if mode == "substr":
+        return pattern in url
+    if mode == "regex":
+        return re.search(pattern, url) is not None
+    raise ValueError(f"Unknown grep mode: {mode}")
+
+
+def filter_urls(urls: List[str], include: Optional[str], exclude: Optional[str], grep_mode: str) -> List[str]:
+    out = []
+    for u in urls:
+        if include and not grep_match(u, include, grep_mode):
+            continue
+        if exclude and grep_match(u, exclude, grep_mode):
+            continue
+        out.append(u)
+    return out
+
+
+def make_session(proxy: Optional[str], timeout: float) -> requests.Session:
+    """
+    Build a requests session with retry/backoff. Created per worker call (thread-safe).
+    """
+    s = requests.Session()
+
+    retries = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.7,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+
+    if proxy:
+        s.proxies.update({"http": proxy, "https": proxy})
+
+    # Keep timeouts in request call; this is just a helper.
+    return s
+
+
+def looks_like_js(url: str, ctype: str, head: bytes) -> bool:
+    """
+    JS detection:
+      - content-type includes javascript/ecmascript
+      - OR url ends with .js / .mjs / .cjs
+      - OR quick content sniff on first ~200 bytes
+    """
+    u = url.lower()
+    ct = (ctype or "").lower()
+
+    if ("javascript" in ct) or ("ecmascript" in ct):
+        return True
+    if u.endswith((".js", ".mjs", ".cjs")):
+        return True
+
+    # Sniff (very lightweight)
+    # Decode as latin1 to avoid exceptions; we're just looking for common JS markers.
+    try:
+        s = head.decode("latin1", errors="ignore").lstrip()
+    except Exception:
+        return False
+
+    js_markers = (
+        "(()=>", "(function(", "function(", "var ", "let ", "const ", "import ", "export ",
+        "window.", "document.", "self.", "globalThis", "webpackJsonp", "__webpack_require__",
+        "//# sourceMappingURL=", "/*# sourceMappingURL="
+    )
+    return any(s.startswith(m) for m in js_markers) or ("sourceMappingURL=" in s[:400])
+
+
+def fetch_single(
+    url: str,
+    outdir: str,
+    js_only: bool,
+    include_non_js: bool,
+    max_bytes: int,
+    timeout: float,
+    verify_tls: bool,
+    delay: float,
+    proxy: Optional[str],
+    beautify: bool,
+    save_headers: bool,
+) -> Tuple[str, Optional[str], str, Optional[str], str, Optional[Dict[str, List[str]]]]:
+    """
+    Return (url, path_or_None, status_string, final_url, content_type, headers_or_None)
+    """
+    try:
+        if delay > 0:
+            time.sleep(delay)
+
+        session = make_session(proxy=proxy, timeout=timeout)
+
+        r = session.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            stream=True,
+            verify=verify_tls,
+            headers={
+                # Avoid compression surprises; easier to diff content and sniff.
+                "Accept-Encoding": "identity",
+                "User-Agent": "fetch_and_scan/1.1",
+            },
+        )
+
+        status = r.status_code
+        final_url = str(r.url)
+        ctype = (r.headers.get("content-type", "") or "").lower()
+
+        if status < 200 or status >= 400:
+            return url, None, f"HTTP_{status}", final_url, ctype, None
+
+        # Limit size + also capture a small head for JS sniffing
+        content = b""
+        head = b""
+        head_cap = 512
+
+        for chunk in r.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            if len(head) < head_cap:
+                needed = head_cap - len(head)
+                head += chunk[:needed]
+            content += chunk
+            if len(content) > max_bytes:
+                return url, None, f"SKIP_TOO_LARGE>{max_bytes}B", final_url, ctype, None
+
+        is_js = looks_like_js(url=final_url, ctype=ctype, head=head)
+
+        # JS-only guard:
+        # - If js_only AND not JS AND not include_non_js => skip
+        if js_only and (not is_js) and (not include_non_js):
+            return url, None, f"SKIP_NOT_JS:{status};ctype={ctype}", final_url, ctype, None
+
+        os.makedirs(outdir, exist_ok=True)
+
+        # Decide extension: .js if looks like JS else .bin
+        force_ext = ".js" if is_js else ".bin"
+        outpath = filename_for_url(final_url, outdir, force_ext=force_ext)
+
+        # Write raw bytes first
+        with open(outpath, "wb") as fh:
+            fh.write(content)
+
+        # Optional beautification (only makes sense for JS)
+        if beautify and is_js:
+            if jsbeautifier is None:
+                hdrs = {k: [v] for k, v in r.headers.items()} if save_headers else None
+                return url, outpath, f"{status};NO_JSBEAUTIFIER", final_url, ctype, hdrs
+            try:
+                text = content.decode("utf-8", errors="ignore")
+                pretty = jsbeautifier.beautify(text)
+                with open(outpath, "w", encoding="utf-8", errors="ignore") as fh:
+                    fh.write(pretty)
+                hdrs = {k: [v] for k, v in r.headers.items()} if save_headers else None
+                return url, outpath, f"{status};BEAUTIFIED", final_url, ctype, hdrs
+            except Exception as e:
+                hdrs = {k: [v] for k, v in r.headers.items()} if save_headers else None
+                return url, outpath, f"{status};BEAUTIFY_ERR:{e}", final_url, ctype, hdrs
+
+        hdrs = {k: [v] for k, v in r.headers.items()} if save_headers else None
+        return url, outpath, str(status), final_url, ctype, hdrs
+
+    except requests.exceptions.SSLError as e:
+        return url, None, f"SSL_ERR:{e}", None, "", None
+    except requests.exceptions.ProxyError as e:
+        return url, None, f"PROXY_ERR:{e}", None, "", None
+    except requests.exceptions.ConnectTimeout:
+        return url, None, "TIMEOUT_CONNECT", None, "", None
+    except requests.exceptions.ReadTimeout:
+        return url, None, "TIMEOUT_READ", None, "", None
+    except Exception as e:
+        return url, None, f"ERR:{e!r}", None, "", None
+
+
+def scan_file_for_patterns(path: str, patterns) -> List[Tuple[str, int, str, str, str]]:
+    """
+    Scan a single file for interesting patterns.
+    Returns list of (path, lineno, rule, match, snippet).
+    """
+    findings: List[Tuple[str, int, str, str, str]] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for idx, line in enumerate(fh, start=1):
+                for rule, rx in patterns.items():
+                    m = rx.search(line)
+                    if not m:
+                        continue
+                    match = m.group(0)
+                    snippet = line.strip()
+                    # keep snippet bounded
+                    if len(snippet) > 240:
+                        snippet = snippet[:240] + "..."
+                    findings.append((path, idx, rule, match, snippet))
+    except Exception:
+        # Binary or unreadable content; ignore
+        pass
+    return findings
+
+
+def write_headers_jsonl(path: str, items: List[Dict]):
+    with open(path, "w", encoding="utf-8") as fh:
+        for it in items:
+            fh.write(json.dumps(it, ensure_ascii=False) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Fetch JS from URLs and scan for secrets/endpoints.")
+    ap.add_argument("input", nargs="?", help="Input file (CSV with url column, or one URL per line).")
+    ap.add_argument("-i", "--input", dest="input_flag", help="Alias for positional input.")
+    ap.add_argument("-o", "--outdir", default=DEFAULT_OUTDIR, help=f"Output directory (default: {DEFAULT_OUTDIR})")
+    ap.add_argument("--map-file", default=DEFAULT_MAP_FILE, help=f"Fetch map output (default: {DEFAULT_MAP_FILE})")
+    ap.add_argument("--findings-file", default=DEFAULT_FINDINGS_FILE, help=f"Findings output (default: {DEFAULT_FINDINGS_FILE})")
+    ap.add_argument("--results-json", default=DEFAULT_RESULTS_JSON, help=f"Results JSON (default: {DEFAULT_RESULTS_JSON})")
+    ap.add_argument("--json", dest="results_json_alias", help="Alias for --results-json")
+
+    ap.add_argument("-w", "--workers", type=int, default=8, help="Number of concurrent workers (default: 8)")
+    ap.add_argument("--delay", type=float, default=0.0, help="Delay (seconds) per request per worker (default: 0)")
+    ap.add_argument("--timeout", type=float, default=20.0, help="Request timeout in seconds (default: 20)")
+    ap.add_argument("--max-bytes", type=int, default=4_000_000, help="Max bytes per download (default: 4000000)")
+    ap.add_argument("--proxy", help="HTTP proxy (e.g. http://127.0.0.1:8080)")
+    ap.add_argument("--insecure", action="store_true", help="Disable TLS verification")
+    ap.add_argument("--beautify", action="store_true", help="Beautify JS output (requires jsbeautifier)")
+
+    ap.add_argument("--grep", "--include", dest="include", help="Include only URLs matching this pattern (glob/substr/regex)")
+    ap.add_argument("--exclude", dest="exclude", help="Exclude URLs matching this pattern (glob/substr/regex)")
+    ap.add_argument("--grep-mode", choices=["auto", "glob", "substr", "regex"], default="auto", help="How to interpret include/exclude patterns")
+
+    ap.add_argument("--js-only", action="store_true", default=True, help="Only keep JS (default: true)")
+    ap.add_argument("--include-non-js", action="store_true", help="Allow non-JS content to be saved/scanned too")
+
+    # New: headers capture
+    ap.add_argument("--save-headers", action="store_true", help="Save response headers in results.json and write headers JSONL")
+    ap.add_argument("--headers-jsonl", default=DEFAULT_HEADERS_JSONL, help=f"Headers JSONL output (default: {DEFAULT_HEADERS_JSONL})")
+
+    args = ap.parse_args()
+
+    infile = args.input_flag or args.input
+    if not infile:
+        ap.error("Provide input file as positional arg or -i/--input")
+
+    results_json = args.results_json_alias or args.results_json
+
+    urls = load_urls(infile)
+    urls = filter_urls(urls, args.include, args.exclude, args.grep_mode)
+
+    if not urls:
+        print("No URLs after filtering.", file=sys.stderr)
+        sys.exit(1)
+
+    patterns = build_patterns()
+
+    fetch_rows: List[Dict] = []
+    findings_rows: List[Dict] = []
+    headers_rows: List[Dict] = []
+
+    # Fetch
+    with open(args.map_file, "w", encoding="utf-8") as map_fh:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = []
+            for u in urls:
+                futures.append(
+                    ex.submit(
+                        fetch_single,
+                        u,
+                        args.outdir,
+                        args.js_only,
+                        args.include_non_js,
+                        args.max_bytes,
+                        args.timeout,
+                        not args.insecure,
+                        args.delay,
+                        args.proxy,
+                        args.beautify,
+                        args.save_headers,
+                    )
+                )
+
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="fetch"):
+                url, outpath, status_str, final_url, ctype, hdrs = fut.result()
+                map_fh.write(f"{url}\t{outpath or ''}\t{status_str}\n")
+
+                fetch_item = {
+                    "url": url,
+                    "final_url": final_url,
+                    "path": outpath,
+                    "status": status_str,
+                    "content_type": ctype,
+                }
+                if args.save_headers and hdrs and final_url:
+                    fetch_item["headers"] = hdrs
+                    headers_rows.append({"url": final_url, "headers": hdrs})
+
+                fetch_rows.append(fetch_item)
+
+    # Scan
+    # Only scan files that were written
+    paths = [r["path"] for r in fetch_rows if r.get("path")]
+    with open(args.findings_file, "w", encoding="utf-8") as out_fh:
+        for p in tqdm(paths, desc="scan"):
+            if not p or not os.path.exists(p):
+                continue
+            for (path, lineno, rule, match, snippet) in scan_file_for_patterns(p, patterns):
+                # Identify url by reverse lookup (cheap for your scale)
+                url_for_file = next((x.get("final_url") or x["url"] for x in fetch_rows if x.get("path") == path), None)
+                row = {
+                    "url": url_for_file,
+                    "file": path,
+                    "line": lineno,
+                    "rule": rule,
+                    "match": match,
+                    "snippet": snippet,
+                }
+                findings_rows.append(row)
+                out_fh.write(f"{path}\t{lineno}\t{rule}\t{match}\t{snippet}\n")
+
+    # Write results.json
+    results = {"fetch": fetch_rows, "findings": findings_rows}
+    with open(results_json, "w", encoding="utf-8") as fh:
+        json.dump(results, fh, ensure_ascii=False, indent=2)
+
+    # Write headers jsonl if requested
+    if args.save_headers:
+        write_headers_jsonl(args.headers_jsonl, headers_rows)
+
+    print(f"[+] Saved: {args.outdir}/, {args.map_file}, {args.findings_file}, {results_json}")
+    if args.save_headers:
+        print(f"[+] Headers: {args.headers_jsonl}")
+
+
+if __name__ == "__main__":
+    main()
